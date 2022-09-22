@@ -35,19 +35,6 @@ def DarknetConv2D(*args, **kwargs):
     return Conv2D(*args, **darknet_conv_kwargs)
     
 #---------------------------------------------------#
-#   卷积块 -> 卷积 + 标准化
-#   DarknetConv2D + BatchNormalization
-#---------------------------------------------------#
-def DarknetConv2D_BN(*args, **kwargs):
-    no_bias_kwargs = {'use_bias': False}
-    no_bias_kwargs.update(kwargs)
-    if "name" in kwargs.keys():
-        no_bias_kwargs['name'] = kwargs['name'] + '.conv'
-    return compose(
-        DarknetConv2D(*args, **no_bias_kwargs),
-        BatchNormalization(momentum = 0.97, epsilon = 0.001, name = kwargs['name'] + '.bn'))
-    
-#---------------------------------------------------#
 #   卷积块 -> 卷积 + 标准化 + 激活函数
 #   DarknetConv2D + BatchNormalization + SiLU
 #---------------------------------------------------#

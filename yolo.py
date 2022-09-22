@@ -1,12 +1,13 @@
 import colorsys
 import os
 import time
+import gc
 
 import numpy as np
 from keras import backend as K
 from PIL import ImageDraw, ImageFont
 
-from nets.yolo import yolo_body
+from nets.yolo import yolo_body, fusion_rep_vgg
 from utils.utils import (cvtColor, get_anchors, get_classes, preprocess_input,
                          resize_image, show_config)
 from utils.utils_bbox import DecodeBox
@@ -22,7 +23,7 @@ class YOLO(object):
         #   验证集损失较低不代表mAP较高，仅代表该权值在验证集上泛化性能较好。
         #   如果出现shape不匹配，同时要注意训练时的model_path和classes_path参数的修改
         #--------------------------------------------------------------------------#
-        "model_path"        : 'model_data/yolov7_x_weights.h5',
+        "model_path"        : 'model_data/yolov7_weights.h5',
         "classes_path"      : 'model_data/coco_classes.txt',
         #---------------------------------------------------------------------#
         #   anchors_path代表先验框对应的txt文件，一般不修改。
@@ -37,7 +38,7 @@ class YOLO(object):
         #---------------------------------------------------------------------#
         #   所使用的YoloV7的版本。l、x
         #---------------------------------------------------------------------#
-        "phi"               : 'x',
+        "phi"               : 'l',
         #---------------------------------------------------------------------#
         #   只有得分大于置信度的预测框会被保留下来
         #---------------------------------------------------------------------#
@@ -101,7 +102,20 @@ class YOLO(object):
         
         self.yolo_model = yolo_body([None, None, 3], self.anchors_mask, self.num_classes, self.phi)
         self.yolo_model.load_weights(self.model_path, by_name=True)
-        print('{} model, anchors, and classes loaded.'.format(model_path))
+        if self.phi == "l":
+            fuse_layers = [
+                ["rep_conv_1", False, True],
+                ["rep_conv_2", False, True],
+                ["rep_conv_3", False, True],
+            ]
+            self.yolo_model_fuse = yolo_body([None, None, 3], self.anchors_mask, self.num_classes, self.phi, mode="predict")
+            self.yolo_model_fuse.load_weights(self.model_path, by_name=True)
+
+            fusion_rep_vgg(fuse_layers, self.yolo_model, self.yolo_model_fuse)
+            del self.yolo_model
+            gc.collect()
+            self.yolo_model = self.yolo_model_fuse
+        
         #---------------------------------------------------------#
         #   在yolo_eval函数中，我们会对预测结果进行后处理
         #   后处理的内容包括，解码、非极大抑制、门限筛选等

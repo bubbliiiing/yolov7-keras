@@ -1,9 +1,11 @@
-from keras.layers import (Concatenate, Input, Lambda, UpSampling2D, MaxPooling2D, Add, BatchNormalization, Conv2D,
-                          ZeroPadding2D)
+import numpy as np
+from keras.layers import (Add, BatchNormalization, Concatenate, Conv2D, Input,
+                          Lambda, MaxPooling2D, UpSampling2D)
 from keras.models import Model
 
-from nets.backbone import (DarknetConv2D, DarknetConv2D_BN, DarknetConv2D_BN_SiLU, Transition_Block, Multi_Concat_Block, SiLU,
-                             darknet_body)
+from nets.backbone import (DarknetConv2D, DarknetConv2D_BN_SiLU,
+                           Multi_Concat_Block, SiLU, Transition_Block,
+                           darknet_body)
 from nets.yolo_training import yolo_loss
 
 
@@ -23,20 +25,77 @@ def SPPCSPC(x, c2, n=1, shortcut=False, g=1, e=0.5, k=(5, 9, 13), name=""):
     
     return out
 
-def RepConv(x, c2, name=""):
-    x1 = Conv2D(c2, (3, 3), name = name + '.rbr_dense.0', use_bias=False, padding='same')(x)
-    x1 = BatchNormalization(momentum = 0.97, epsilon = 0.001, name = name + '.rbr_dense.1')(x1)
-    x2 = Conv2D(c2, (1, 1), name = name + '.rbr_1x1.0', use_bias=False, padding='same')(x)
-    x2 = BatchNormalization(momentum = 0.97, epsilon = 0.001, name = name + '.rbr_1x1.1')(x2)
-    
-    out = Add()([x1, x2])
-    out = SiLU()(out)
+def fusion_rep_vgg(fuse_layers, trained_model, infer_model):
+    for layer_name, use_bias, use_bn in fuse_layers:
+
+        conv_kxk_weights = trained_model.get_layer(layer_name + '.rbr_dense.0').get_weights()[0]
+        conv_1x1_weights = trained_model.get_layer(layer_name + '.rbr_1x1.0').get_weights()[0]
+
+        if use_bias:
+            conv_kxk_bias = trained_model.get_layer(layer_name + '.rbr_dense.0').get_weights()[1]
+            conv_1x1_bias = trained_model.get_layer(layer_name + '.rbr_1x1.0').get_weights()[1]
+        else:
+            conv_kxk_bias = np.zeros((conv_kxk_weights.shape[-1],))
+            conv_1x1_bias = np.zeros((conv_1x1_weights.shape[-1],))
+
+        if use_bn:
+            gammas_kxk, betas_kxk, means_kxk, var_kxk = trained_model.get_layer(layer_name + '.rbr_dense.1').get_weights()
+            gammas_1x1, betas_1x1, means_1x1, var_1x1 = trained_model.get_layer(layer_name + '.rbr_1x1.1').get_weights()
+
+        else:
+            gammas_1x1, betas_1x1, means_1x1, var_1x1 = [np.ones((conv_1x1_weights.shape[-1],)),
+                                                         np.zeros((conv_1x1_weights.shape[-1],)),
+                                                         np.zeros((conv_1x1_weights.shape[-1],)),
+                                                         np.ones((conv_1x1_weights.shape[-1],))]
+            gammas_kxk, betas_kxk, means_kxk, var_kxk = [np.ones((conv_kxk_weights.shape[-1],)),
+                                                         np.zeros((conv_kxk_weights.shape[-1],)),
+                                                         np.zeros((conv_kxk_weights.shape[-1],)),
+                                                         np.ones((conv_kxk_weights.shape[-1],))]
+        gammas_res, betas_res, means_res, var_res = [np.ones((conv_1x1_weights.shape[-1],)),
+                                                     np.zeros((conv_1x1_weights.shape[-1],)),
+                                                     np.zeros((conv_1x1_weights.shape[-1],)),
+                                                     np.ones((conv_1x1_weights.shape[-1],))]
+
+        # _fuse_bn_tensor(self.rbr_dense)
+        w_kxk = (gammas_kxk / np.sqrt(np.add(var_kxk, 1e-3))) * conv_kxk_weights
+        b_kxk = (((conv_kxk_bias - means_kxk) * gammas_kxk) / np.sqrt(np.add(var_kxk, 1e-3))) + betas_kxk
+        
+        # _fuse_bn_tensor(self.rbr_dense)
+        kernel_size = w_kxk.shape[0]
+        in_channels = w_kxk.shape[2]
+        w_1x1 = np.zeros_like(w_kxk)
+        w_1x1[kernel_size // 2, kernel_size // 2, :, :] = (gammas_1x1 / np.sqrt(np.add(var_1x1, 1e-3))) * conv_1x1_weights
+        b_1x1 = (((conv_1x1_bias - means_1x1) * gammas_1x1) / np.sqrt(np.add(var_1x1, 1e-3))) + betas_1x1
+
+        w_res = np.zeros_like(w_kxk)
+        for i in range(in_channels):
+            w_res[kernel_size // 2, kernel_size // 2, i % in_channels, i] = 1
+        w_res = ((gammas_res / np.sqrt(np.add(var_res, 1e-3))) * w_res)
+        b_res = (((0 - means_res) * gammas_res) / np.sqrt(np.add(var_res, 1e-3))) + betas_res
+
+        weight = [w_res, w_1x1, w_kxk]
+        bias = [b_res, b_1x1, b_kxk]
+        
+        infer_model.get_layer(layer_name).set_weights([np.array(weight).sum(axis=0), np.array(bias).sum(axis=0)])
+
+def RepConv(x, c2, mode="train", name=""):
+    if mode == "predict":
+        out = Conv2D(c2, (3, 3), name = name, use_bias=True, padding='same')(x)
+        out = SiLU()(out)
+    elif mode == "train":
+        x1 = Conv2D(c2, (3, 3), name = name + '.rbr_dense.0', use_bias=False, padding='same')(x)
+        x1 = BatchNormalization(momentum = 0.97, epsilon = 0.001, name = name + '.rbr_dense.1')(x1)
+        x2 = Conv2D(c2, (1, 1), name = name + '.rbr_1x1.0', use_bias=False, padding='same')(x)
+        x2 = BatchNormalization(momentum = 0.97, epsilon = 0.001, name = name + '.rbr_1x1.1')(x2)
+        
+        out = Add()([x1, x2])
+        out = SiLU()(out)
     return out
 
 #---------------------------------------------------#
 #   Panet网络的构建，并且获得预测结果
 #---------------------------------------------------#
-def yolo_body(input_shape, anchors_mask, num_classes, phi):
+def yolo_body(input_shape, anchors_mask, num_classes, phi, mode="train"):
     #-----------------------------------------------#
     #   定义了不同yolov7版本的参数
     #-----------------------------------------------#
@@ -77,9 +136,9 @@ def yolo_body(input_shape, anchors_mask, num_classes, phi):
     P5 = Multi_Concat_Block(P5, panet_channels * 8, transition_channels * 16, e=e, n=n, ids=ids, name="conv3_for_downsample2")
     
     if phi == "l":
-        P3 = RepConv(P3, transition_channels * 8, name="rep_conv_1")
-        P4 = RepConv(P4, transition_channels * 16, name="rep_conv_2")
-        P5 = RepConv(P5, transition_channels * 32, name="rep_conv_3")
+        P3 = RepConv(P3, transition_channels * 8, mode, name="rep_conv_1")
+        P4 = RepConv(P4, transition_channels * 16, mode, name="rep_conv_2")
+        P5 = RepConv(P5, transition_channels * 32, mode, name="rep_conv_3")
     else:
         P3 = DarknetConv2D_BN_SiLU(transition_channels * 8, (3, 3), strides=(1, 1), name="rep_conv_1")(P3)
         P4 = DarknetConv2D_BN_SiLU(transition_channels * 16, (3, 3), strides=(1, 1), name="rep_conv_2")(P4)
