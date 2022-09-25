@@ -1,4 +1,5 @@
 import math
+import copy
 from random import shuffle, sample
 
 import cv2
@@ -54,13 +55,19 @@ class YoloDatasets(keras.utils.Sequence):
                     image, box      = self.get_random_data_with_MixUp(image, box, image_2, box_2)
             else:
                 image, box  = self.get_random_data(self.annotation_lines[i], self.input_shape, random = self.train)
+                
             image_data.append(preprocess_input(np.array(image, np.float32)))
             box_data.append(box)
 
+        labels              = copy.deepcopy(np.array(box_data))
+        labels[..., 2:4]    = labels[..., 2:4] - labels[..., 0:2]
+        labels[..., 0:2]    = labels[..., 0:2] + labels[..., 2:4] / 2 
+        
         image_data  = np.array(image_data)
         box_data    = np.array(box_data)
         y_true      = self.preprocess_true_boxes(box_data, self.input_shape, self.anchors, self.num_classes)
-        return [image_data, *y_true], np.zeros(self.batch_size)
+        
+        return [image_data, *y_true, labels], np.zeros(self.batch_size)
 
     def on_epoch_end(self):
         self.epoch_now += 1
@@ -432,7 +439,7 @@ class YoloDatasets(keras.utils.Sequence):
         #   m,40,40,3,5+num_classses
         #   m,80,80,3,5+num_classses
         #-----------------------------------------------------------#
-        y_true = [np.zeros((m, grid_shapes[l][0], grid_shapes[l][1], len(self.anchors_mask[l]), 5 + num_classes),
+        y_true = [np.zeros((m, grid_shapes[l][0], grid_shapes[l][1], len(self.anchors_mask[l]), 2),
                     dtype='float32') for l in range(num_layers)]
         #-----------------------------------------------------#
         #   用于帮助先验框找到最对应的真实框
@@ -468,7 +475,8 @@ class YoloDatasets(keras.utils.Sequence):
             #-----------------------------------------------------------#
             wh = boxes_wh[b, valid_mask[b]]
 
-            if len(wh) == 0: continue
+            if len(wh) == 0: 
+                continue
             #-------------------------------------------------------#
             #   wh                          : num_true_box, 2
             #   np.expand_dims(wh, 1)       : num_true_box, 1, 2
@@ -521,17 +529,11 @@ class YoloDatasets(keras.utils.Sequence):
                                 else:
                                     continue
                             #-----------------------------------------------------------#
-                            #   c指的是当前这个真实框的种类
-                            #-----------------------------------------------------------#
-                            c = true_boxes[b, t, 4].astype('int32')
-                            #-----------------------------------------------------------#
                             #   y_true的shape为(m,20,20,3,85)(m,40,40,3,85)(m,80,80,3,85)
                             #   最后的85可以拆分成4+1+80，4代表的是框的中心与宽高、
                             #   1代表的是置信度、80代表的是种类
                             #-----------------------------------------------------------#
-                            y_true[l][b, local_j, local_i, k, 0:4] = true_boxes[b, t, 0:4]
-                            y_true[l][b, local_j, local_i, k, 4] = 1
-                            y_true[l][b, local_j, local_i, k, 5+c] = 1
+                            y_true[l][b, local_j, local_i, k, 0] = 1
+                            y_true[l][b, local_j, local_i, k, 1] = t + 1
                             box_best_ratios[l][b, local_j, local_i, k] = ratio[n]
-
         return y_true

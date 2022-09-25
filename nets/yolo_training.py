@@ -147,7 +147,8 @@ def yolo_loss(
     #   (m,40,40,3,85)
     #   (m,80,80,3,85)
     #---------------------------------------------------------------------------------------------------#
-    y_true          = args[num_layers:]
+    labels          = args[-1]
+    y_true          = args[num_layers:-1]
     yolo_outputs    = args[:num_layers]
 
     #-----------------------------------------------------------#
@@ -155,24 +156,16 @@ def yolo_loss(
     #-----------------------------------------------------------#
     input_shape = K.cast(input_shape, K.dtype(y_true[0]))
 
-    loss    = 0
+    loss        = 0
+    outputs     = []
+    layer_id    = []
+    fg_masks    = []
+    is_in_boxes_and_centers = []
     #---------------------------------------------------------------------------------------------------#
     #   y_true是一个列表，包含三个特征层，shape分别为(m,20,20,3,85),(m,40,40,3,85),(m,80,80,3,85)。
     #   yolo_outputs是一个列表，包含三个特征层，shape分别为(m,20,20,3,85),(m,40,40,3,85),(m,80,80,3,85)。
     #---------------------------------------------------------------------------------------------------#
     for l in range(num_layers):
-        #-----------------------------------------------------------#
-        #   以第一个特征层(m,20,20,3,85)为例子
-        #   取出该特征层中存在目标的点的位置。(m,20,20,3,1)
-        #-----------------------------------------------------------#
-        object_mask = y_true[l][..., 4:5]
-        #-----------------------------------------------------------#
-        #   取出其对应的种类(m,20,20,3,num_classes)
-        #-----------------------------------------------------------#
-        true_class_probs = y_true[l][..., 5:]
-        if label_smoothing:
-            true_class_probs = _smooth_labels(true_class_probs, label_smoothing)
-
         #-----------------------------------------------------------#
         #   将yolo_outputs的特征层输出进行处理、获得四个返回值
         #   其中：
@@ -189,46 +182,221 @@ def yolo_loss(
         #   (m,20,20,3,4)
         #-----------------------------------------------------------#
         pred_box = K.concatenate([pred_xy, pred_wh])
-
-        #-----------------------------------------------------------#
-        #   计算Ciou loss
-        #   raw_true_box 前四个序号的内容是当前这个先验框对应的真实框坐标
-        #   pred_box     每一个特征点每个先验框的预测结果
-        #   box_ciou(pred_box, raw_true_box) 计算每一个特征点上每一个先验框，预测结果和真实情况的ciou
-        #   object_mask  正样本的mask，用于选取正样本，只有正样本才可以计算回归损失。
-        #-----------------------------------------------------------#
-        raw_true_box    = y_true[l][...,0:4]
-        ciou            = box_ciou(pred_box, raw_true_box)
-        ciou_loss       = object_mask * (1 - ciou)
         
-        #------------------------------------------------------------------------------#
-        #   先去计算每一个正样本和当前预测框的重合程度
-        #   使用正样本真实框与预测框的重合程度，作为当前正样本内部是否包含目标的标签
-        #   
-        #   当前的先验框预测越准确，这个先验框才负责这个真实框的预测。
-        #------------------------------------------------------------------------------#
-        tobj            = tf.where(tf.equal(object_mask, 1), tf.maximum(ciou, tf.zeros_like(ciou)), tf.zeros_like(ciou))
-        confidence_loss = K.binary_crossentropy(tobj, raw_pred[..., 4:5], from_logits=True)
-
-        #-----------------------------------------------------------#
-        #   计算分类损失
-        #-----------------------------------------------------------#
-        class_loss      = object_mask * K.binary_crossentropy(true_class_probs, raw_pred[...,5:], from_logits=True)
-
-        #-----------------------------------------------------------#
-        #   计算正样本数量
-        #-----------------------------------------------------------#
-        num_pos         = tf.maximum(K.sum(K.cast(object_mask, tf.float32)), 1)
-
-        location_loss   = K.sum(ciou_loss) * box_ratio / num_pos
-        confidence_loss = K.mean(confidence_loss) * balance[l] * obj_ratio
-        class_loss      = K.sum(class_loss) * cls_ratio / num_pos / num_classes
-
-        loss    += location_loss + confidence_loss + class_loss
-        # if print_loss:
-        # loss = tf.Print(loss, [loss, location_loss, confidence_loss, class_loss], message='loss: ')
+        m       = tf.shape(pred_box)[0]
+        scale   = tf.cast([[[input_shape[1], input_shape[0], input_shape[1], input_shape[0]]]], tf.float32)
+        outputs.append(tf.concat([tf.reshape(pred_box, [m, -1, 4]) * scale, tf.reshape(raw_pred[..., 4:], [m, -1, num_classes + 1])], -1))
+        layer_id.append(tf.ones_like(outputs[-1][:, :, 0]) * l)
+        fg_masks.append(tf.reshape(y_true[l][..., 0:1], [m, -1]))
+        is_in_boxes_and_centers.append(tf.reshape(y_true[l][..., 1:2], [m, -1]))
+    
+    outputs     = tf.concat(outputs, 1)
+    layer_id    = tf.concat(layer_id, 1)
+    fg_masks    = tf.concat(fg_masks, 1)
+    is_in_boxes_and_centers = tf.concat(is_in_boxes_and_centers, 1)
         
+    #-----------------------------------------------#
+    #   [batch, n_anchors_all, 4] 预测框的坐标
+    #   [batch, n_anchors_all, 1] 特征点是否有对应的物体
+    #   [batch, n_anchors_all, n_cls] 特征点对应物体的种类
+    #-----------------------------------------------#
+    bbox_preds  = outputs[:, :, :4]  
+    obj_preds   = outputs[:, :, 4:5]
+    cls_preds   = outputs[:, :, 5:]  
+    
+    #------------------------------------------------------------#
+    #   labels                      [batch, max_boxes, 5]
+    #   tf.reduce_sum(labels, -1)   [batch, max_boxes]
+    #   nlabel                      [batch]
+    #------------------------------------------------------------#
+    nlabel = tf.reduce_sum(tf.cast(tf.reduce_sum(labels, -1) > 0, K.dtype(outputs)), -1)
+    total_num_anchors = tf.shape(outputs)[1]
+    
+    num_fg      = 0.0
+    loss_obj    = 0.0
+    loss_cls    = 0.0
+    loss_iou    = 0.0
+    def loop_body(b, num_fg, loss_iou, loss_obj, loss_cls):
+        # num_gt 单张图片的真实框的数量
+        num_gt  = tf.cast(nlabel[b], tf.int32)
+        #-----------------------------------------------#
+        #   gt_bboxes_per_image     [num_gt, 4]
+        #   gt_classes              [num_gt]
+        #   bboxes_preds_per_image  [n_anchors_all, 4]
+        #   obj_preds_per_image     [n_anchors_all, 1]
+        #   cls_preds_per_image     [n_anchors_all, num_classes]
+        #-----------------------------------------------#
+        gt_bboxes_per_image     = labels[b][:num_gt, :4]
+        gt_classes              = labels[b][:num_gt,  4]
+        bboxes_preds_per_image  = bbox_preds[b]
+        obj_preds_per_image     = obj_preds[b]
+        cls_preds_per_image     = cls_preds[b]
+
+        def f1():
+            num_fg_img  = tf.cast(tf.constant(0), K.dtype(outputs))
+            cls_target  = tf.cast(tf.zeros((0, num_classes)), K.dtype(outputs))
+            reg_target  = tf.cast(tf.zeros((0, 4)), K.dtype(outputs))
+            obj_target  = tf.cast(tf.zeros((total_num_anchors, 1)), K.dtype(outputs))
+            fg_mask     = tf.cast(tf.zeros(total_num_anchors), tf.bool)
+            return num_fg_img, cls_target, reg_target, obj_target, fg_mask
+        def f2():
+            fg_mask = tf.cast(fg_masks[b], tf.bool)
+            gt_matched_classes, fg_mask, pred_ious_this_matching, matched_gt_inds, num_fg_img = get_assignments( 
+                fg_mask, gt_bboxes_per_image, gt_classes, bboxes_preds_per_image, obj_preds_per_image, cls_preds_per_image, num_classes, num_gt, 
+            )
+            reg_target  = tf.cast(tf.gather_nd(gt_bboxes_per_image, tf.reshape(matched_gt_inds, [-1, 1])), K.dtype(outputs))
+            cls_target  = tf.cast(tf.one_hot(tf.cast(gt_matched_classes, tf.int32), num_classes) * tf.expand_dims(pred_ious_this_matching, -1), K.dtype(outputs))
+            obj_target  = tf.cast(tf.expand_dims(fg_mask, -1), K.dtype(outputs))
+            return num_fg_img, cls_target, reg_target, obj_target, fg_mask
+            
+        num_fg_img, cls_target, reg_target, obj_target, fg_mask = tf.cond(tf.equal(num_gt, 0), f1, f2)
+        num_fg      += num_fg_img
+        # reg_target = tf.Print(reg_target, [num_fg_img, reg_target, tf.boolean_mask(bboxes_preds_per_image, fg_mask)], summarize=1000)
+
+        _loss_iou   = 1 - box_ciou(reg_target, tf.boolean_mask(bboxes_preds_per_image, fg_mask))
+        _loss_obj   = K.binary_crossentropy(_smooth_labels(obj_target, label_smoothing), obj_preds_per_image, from_logits=True)
+        _loss_cls   = K.binary_crossentropy(cls_target, tf.boolean_mask(cls_preds_per_image, fg_mask), from_logits=True)
+        for layer in range(len(balance)):
+            num_pos = tf.maximum(K.sum(tf.cast(tf.logical_and(tf.equal(layer_id[b], layer), fg_mask), tf.float32)), 1)
+
+            loss_iou += K.sum(tf.boolean_mask(_loss_iou, tf.boolean_mask(tf.logical_and(tf.equal(layer_id[b], layer), fg_mask), fg_mask))) * box_ratio / num_pos
+            loss_obj += K.mean(tf.boolean_mask(_loss_obj, tf.equal(layer_id[b], layer)) * balance[layer]) * obj_ratio
+            loss_cls += K.sum(tf.boolean_mask(_loss_cls, tf.boolean_mask(tf.logical_and(tf.equal(layer_id[b], layer), fg_mask), fg_mask))) * cls_ratio / num_pos / num_classes
+        return b + 1, num_fg, loss_iou, loss_obj, loss_cls
+    #-----------------------------------------------------------#
+    #   在这个地方进行一个循环、循环是对每一张图片进行的
+    #-----------------------------------------------------------#
+    _, num_fg, loss_iou, loss_obj, loss_cls = tf.while_loop(lambda b,*args: b < tf.cast(tf.shape(outputs)[0], tf.int32), loop_body, [0, num_fg, loss_iou, loss_obj, loss_cls])
+    
+    num_fg      = tf.cast(tf.maximum(num_fg, 1), K.dtype(outputs))
+    loss        = (loss_iou + loss_cls + loss_obj) / tf.cast(tf.shape(outputs)[0], tf.float32)
+    # loss = tf.Print(loss, [num_fg, loss_iou / tf.cast(tf.shape(outputs)[0], tf.float32), loss_obj / tf.cast(tf.shape(outputs)[0], tf.float32), loss_cls / tf.cast(tf.shape(outputs)[0], tf.float32) ])
     return loss
+
+def get_assignments(fg_mask, gt_bboxes_per_image, gt_classes, bboxes_preds_per_image, obj_preds_per_image, cls_preds_per_image, num_classes, num_gt):
+    #-------------------------------------------------------#
+    #   获得在真实框内部的特征点的预测结果
+    #   fg_mask                 [n_anchors_all]
+    #   bboxes_preds_per_image  [fg_mask, 4]
+    #   cls_preds_              [fg_mask, num_classes]
+    #   obj_preds_              [fg_mask, 1]
+    #-------------------------------------------------------#
+    bboxes_preds_per_image  = tf.boolean_mask(bboxes_preds_per_image, fg_mask, axis = 0)
+    obj_preds_              = tf.boolean_mask(obj_preds_per_image, fg_mask, axis = 0)
+    cls_preds_              = tf.boolean_mask(cls_preds_per_image, fg_mask, axis = 0)
+    num_in_boxes_anchor     = tf.shape(bboxes_preds_per_image)[0]
+    #-------------------------------------------------------#
+    #   计算真实框和预测框的重合程度
+    #   pair_wise_ious      [num_gt, fg_mask]
+    #-------------------------------------------------------#
+    # gt_bboxes_per_image = tf.Print(gt_bboxes_per_image, [gt_bboxes_per_image, bboxes_preds_per_image], summarize=1000)
+    pair_wise_ious      = box_iou(gt_bboxes_per_image, bboxes_preds_per_image)
+    pair_wise_ious_loss = -tf.log(pair_wise_ious + 1e-8)
+    #-------------------------------------------------------#
+    #   计算真实框和预测框种类置信度的交叉熵
+    #   cls_preds_          [num_gt, fg_mask, num_classes]
+    #   gt_cls_per_image    [num_gt, fg_mask, num_classes]
+    #   pair_wise_cls_loss  [num_gt, fg_mask]
+    #-------------------------------------------------------#
+    gt_cls_per_image    = tf.tile(tf.expand_dims(tf.one_hot(tf.cast(gt_classes, tf.int32), num_classes), 1), (1, num_in_boxes_anchor, 1))
+    cls_preds_          = K.sigmoid(tf.tile(tf.expand_dims(cls_preds_, 0), (num_gt, 1, 1))) *\
+                          K.sigmoid(tf.tile(tf.expand_dims(obj_preds_, 0), (num_gt, 1, 1)))
+
+    pair_wise_cls_loss  = tf.reduce_sum(K.binary_crossentropy(gt_cls_per_image, tf.sqrt(cls_preds_)), -1)
+    #-------------------------------------------------------#
+    #   种类比较接近的情况瞎，交叉熵较低
+    #   真实框和预测框重合度较高的时候，cost较低
+    #   这个特征点是要有对应的真实框的，cost才会低
+    #-------------------------------------------------------#
+    cost = pair_wise_cls_loss + 3.0 * pair_wise_ious_loss
+
+    gt_matched_classes, fg_mask, pred_ious_this_matching, matched_gt_inds, num_fg = dynamic_k_matching(cost, pair_wise_ious, fg_mask, gt_classes, num_gt)
+    return gt_matched_classes, fg_mask, pred_ious_this_matching, matched_gt_inds, num_fg
+
+def dynamic_k_matching(cost, pair_wise_ious, fg_mask, gt_classes, num_gt):
+    #-------------------------------------------------------#
+    #   matching_matrix     [num_gt, fg_mask]
+    #   cost                [num_gt, fg_mask]
+    #   pair_wise_ious      [num_gt, fg_mask] 每一个真实框和预测框的重合情况
+    #   gt_classes          [num_gt]        
+    #   fg_mask             [n_anchors_all]
+    #-------------------------------------------------------#
+    matching_matrix         = tf.zeros_like(cost)
+
+    #------------------------------------------------------------#
+    #   选取iou最大的n_candidate_k个点
+    #   获得当前真实框重合度最大的十个预测框的值
+    #   重合度的值域是[0, 1]，dynamic_ks的值就是[0, 10]
+    #   然后求和，判断应该有多少点用于该框预测
+    #   topk_ious           [num_gt, n_candidate_k]
+    #   dynamic_ks          [num_gt]
+    #   matching_matrix     [num_gt, fg_mask]
+    #------------------------------------------------------------#
+    n_candidate_k           = tf.minimum(20, tf.shape(pair_wise_ious)[1])
+    topk_ious, _            = tf.nn.top_k(pair_wise_ious, n_candidate_k)
+    dynamic_ks              = tf.maximum(tf.reduce_sum(topk_ious, 1), 1)
+    # dynamic_ks              = tf.Print(dynamic_ks, [topk_ious, dynamic_ks], summarize = 100)
+    
+    def loop_body_1(b, matching_matrix):
+        #------------------------------------------------------------#
+        #   给每个真实框选取最小的动态k个点
+        #------------------------------------------------------------#
+        _, pos_idx = tf.nn.top_k(-cost[b], k=tf.cast(dynamic_ks[b], tf.int32))
+        matching_matrix = tf.concat(
+            [matching_matrix[:b], tf.expand_dims(tf.reduce_max(tf.one_hot(pos_idx, tf.shape(cost)[1]), 0), 0), matching_matrix[b+1:]], axis = 0
+        )
+        # matching_matrix = matching_matrix.write(b, K.cast(tf.reduce_max(tf.one_hot(pos_idx, tf.shape(cost)[1]), 0), K.dtype(cost)))
+        return b + 1, matching_matrix
+    #-----------------------------------------------------------#
+    #   在这个地方进行一个循环、循环是对每一张图片进行的
+    #-----------------------------------------------------------#
+    _, matching_matrix = tf.while_loop(lambda b,*args: b < tf.cast(num_gt, tf.int32), loop_body_1, [0, matching_matrix])
+
+    #------------------------------------------------------------#
+    #   anchor_matching_gt  [fg_mask]
+    #------------------------------------------------------------#
+    anchor_matching_gt = tf.reduce_sum(matching_matrix, 0)
+    #------------------------------------------------------------#
+    #   当某一个特征点指向多个真实框的时候
+    #   选取cost最小的真实框。
+    #------------------------------------------------------------#
+    biger_one_indice = tf.reshape(tf.where(anchor_matching_gt > 1), [-1])
+    def loop_body_2(b, matching_matrix):
+        indice_anchor   = tf.cast(biger_one_indice[b], tf.int32)
+        indice_gt       = tf.math.argmin(cost[:, indice_anchor])
+        matching_matrix = tf.concat(
+            [
+                matching_matrix[:, :indice_anchor], 
+                tf.expand_dims(tf.one_hot(indice_gt, tf.cast(num_gt, tf.int32)), 1), 
+                matching_matrix[:, indice_anchor+1:]
+            ], axis = -1
+        )
+        return b + 1, matching_matrix
+    #-----------------------------------------------------------#
+    #   在这个地方进行一个循环、循环是对每一张图片进行的
+    #-----------------------------------------------------------#
+    _, matching_matrix = tf.while_loop(lambda b,*args: b < tf.cast(tf.shape(biger_one_indice)[0], tf.int32), loop_body_2, [0, matching_matrix])
+
+    #------------------------------------------------------------#
+    #   fg_mask_inboxes  [fg_mask]
+    #   num_fg为正样本的特征点个数
+    #------------------------------------------------------------#
+    fg_mask_inboxes = tf.reduce_sum(matching_matrix, 0) > 0.0
+    num_fg          = tf.reduce_sum(tf.cast(fg_mask_inboxes, K.dtype(cost)))
+
+    fg_mask_indices         = tf.reshape(tf.where(fg_mask), [-1])
+    fg_mask_inboxes_indices = tf.reshape(tf.where(fg_mask_inboxes), [-1, 1])
+    fg_mask_select_indices  = tf.gather_nd(fg_mask_indices, fg_mask_inboxes_indices)
+    fg_mask                 = tf.cast(tf.reduce_max(tf.one_hot(fg_mask_select_indices, tf.shape(fg_mask)[0]), 0), K.dtype(fg_mask))
+
+    #------------------------------------------------------------#
+    #   获得特征点对应的物品种类
+    #------------------------------------------------------------#
+    matched_gt_inds     = tf.math.argmax(tf.boolean_mask(matching_matrix, fg_mask_inboxes, axis = 1), 0)
+    gt_matched_classes  = tf.gather_nd(gt_classes, tf.reshape(matched_gt_inds, [-1, 1]))
+
+    pred_ious_this_matching = tf.boolean_mask(tf.reduce_sum(matching_matrix * pair_wise_ious, 0), fg_mask_inboxes)
+    return gt_matched_classes, fg_mask, pred_ious_this_matching, matched_gt_inds, num_fg
 
 
 def get_lr_scheduler(lr_decay_type, lr, min_lr, total_iters, warmup_iters_ratio = 0.05, warmup_lr_ratio = 0.1, no_aug_iter_ratio = 0.05, step_num = 10):
