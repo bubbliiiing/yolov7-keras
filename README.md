@@ -27,7 +27,6 @@ YoloV5-V5.0 | https://github.com/bubbliiiing/yolov5-keras
 YoloV5-V6.1 | https://github.com/bubbliiiing/yolov5-v6.1-keras
 YoloX | https://github.com/bubbliiiing/yolox-keras
 YoloV7 | https://github.com/bubbliiiing/yolov7-keras
-YoloV7-tiny | https://github.com/bubbliiiing/yolov7-tiny-keras
 
 ## 性能情况
 | 训练数据集 | 权值文件名称 | 测试数据集 | 输入图片大小 | mAP 0.5:0.95 | mAP 0.5 |
@@ -41,8 +40,8 @@ keras==2.1.5
 
 ## 文件下载
 训练所需的权值可在百度网盘中下载。  
-链接: https://pan.baidu.com/s/1uYpjWC1uOo3Q-klpUEy9LQ     
-提取码: pmua    
+链接: https://pan.baidu.com/s/1Q82u92m53Q_vetwTDKmJ2Q    
+提取码:    
 
 VOC数据集下载地址如下，里面已经包括了训练集、测试集、验证集（与测试集一样），无需再次划分：  
 链接: https://pan.baidu.com/s/19Mw2u_df_nBzsC2lg20fQA    

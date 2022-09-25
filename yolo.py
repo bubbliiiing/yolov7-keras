@@ -115,7 +115,7 @@ class YOLO(object):
             del self.yolo_model
             gc.collect()
             self.yolo_model = self.yolo_model_fuse
-        
+        print('{} model, anchors, and classes loaded.'.format(model_path))
         #---------------------------------------------------------#
         #   在yolo_eval函数中，我们会对预测结果进行后处理
         #   后处理的内容包括，解码、非极大抑制、门限筛选等

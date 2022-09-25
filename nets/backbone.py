@@ -2,9 +2,8 @@ from functools import wraps
 
 from keras import backend as K
 from keras.initializers import random_normal
-from keras.layers import (Add, BatchNormalization, Concatenate, Conv2D, Layer,
+from keras.layers import (BatchNormalization, Concatenate, Conv2D, Layer,
                           MaxPooling2D, ZeroPadding2D)
-from keras.layers.normalization import BatchNormalization
 from utils.utils import compose
 
 
