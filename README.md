@@ -35,7 +35,7 @@ YoloV7 | https://github.com/bubbliiiing/yolov7-keras
 | COCO-Train2017 | [yolov7_x_weights.h5](https://github.com/bubbliiiing/yolov7-keras/releases/download/v1.0/yolov7_x_weights.h5) | COCO-Val2017 | 640x640 | 52.7 | 71.0
 
 ## 所需环境
-tensorflow-gpu==1.13.2
+tensorflow-gpu==1.13.2    
 keras==2.1.5
 
 ## 文件下载
