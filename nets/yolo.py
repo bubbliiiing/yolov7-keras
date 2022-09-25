@@ -56,22 +56,16 @@ def fusion_rep_vgg(fuse_layers, trained_model, infer_model):
                                                      np.zeros((conv_1x1_weights.shape[-1],)),
                                                      np.ones((conv_1x1_weights.shape[-1],))]
 
-        # _fuse_bn_tensor(self.rbr_dense)
         w_kxk = (gammas_kxk / np.sqrt(np.add(var_kxk, 1e-3))) * conv_kxk_weights
         b_kxk = (((conv_kxk_bias - means_kxk) * gammas_kxk) / np.sqrt(np.add(var_kxk, 1e-3))) + betas_kxk
         
-        # _fuse_bn_tensor(self.rbr_dense)
         kernel_size = w_kxk.shape[0]
-        in_channels = w_kxk.shape[2]
         w_1x1 = np.zeros_like(w_kxk)
         w_1x1[kernel_size // 2, kernel_size // 2, :, :] = (gammas_1x1 / np.sqrt(np.add(var_1x1, 1e-3))) * conv_1x1_weights
         b_1x1 = (((conv_1x1_bias - means_1x1) * gammas_1x1) / np.sqrt(np.add(var_1x1, 1e-3))) + betas_1x1
 
         w_res = np.zeros_like(w_kxk)
-        for i in range(in_channels):
-            w_res[kernel_size // 2, kernel_size // 2, i % in_channels, i] = 1
-        w_res = ((gammas_res / np.sqrt(np.add(var_res, 1e-3))) * w_res)
-        b_res = (((0 - means_res) * gammas_res) / np.sqrt(np.add(var_res, 1e-3))) + betas_res
+        b_res = np.zeros_like(b_kxk)
 
         weight = [w_res, w_1x1, w_kxk]
         bias = [b_res, b_1x1, b_kxk]
